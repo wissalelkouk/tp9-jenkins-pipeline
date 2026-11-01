@@ -1,139 +1,136 @@
-# TP8 : API Express sécurisée et testée
+# TP9 : Pipeline as Code avec Jenkins
 
-API de formulaire de contact (`POST /api/contact`) rendue robuste avec **Zod**, **Helmet**, **express-rate-limit**, puis prouvée par des tests **Vitest + Supertest** et un test d'intégration contre **PostgreSQL** (Docker Compose).
+Pipeline Jenkins décrit dans le dépôt (`Jenkinsfile`) pour l'API Express `contact-api` du TP8 : stages, exécution parallèle, agent Docker, rapports JUnit, credentials, image Docker taguée avec le Git SHA, puis job Multibranch (branches et Pull Requests).
 
-## Sommaire
-1. [Lancer le projet](#1-lancer-le-projet)
-2. [Partie 1 : OWASP API Security Top 10](#2-partie-1--owasp-api-security-top-10)
-3. [Partie 2 : Validation et gestion des erreurs](#3-partie-2--validation-et-gestion-des-erreurs)
-4. [Partie 3 : Durcissement HTTP](#4-partie-3--durcissement-http)
-5. [Partie 4 : Tests de routes et couverture](#5-partie-4--tests-de-routes-et-couverture)
-6. [Partie 5 : PostgreSQL, migrations, intégration](#6-partie-5--postgresql-migrations-et-intégration)
-7. [Bilan](#7-bilan)
+- **Dépôt** : `wissalelkouk/tp9-jenkins-pipeline` (code de l'API issu du TP8)
+- **Dépôt utilisé par Jenkins pendant le TP** : `wissalelkouk/tp8-api-securisee` (les builds visibles sur les captures y ont été exécutés avant la copie du projet vers ce dépôt)
+- **Image Docker Hub** : [`wissl/contact-api`](https://hub.docker.com/r/wissl/contact-api/tags)
+- **Jenkins** : 2.580.1 (LTS), Docker sur la même VM (Ubuntu Server)
+- **Jobs** : `contact-api` (Pipeline from SCM) et `contact-api-multibranch` (Multibranch)
 
-## 1. Lancer le projet
+---
+
+## 1. Le pipeline
+
+Le `Jenkinsfile` à la racine du dépôt définit les stages suivants :
+
+| Stage | Rôle |
+|---|---|
+| Checkout | `checkout scm`, calcul de `SHORT_SHA = GIT_COMMIT.take(7)` |
+| Install | `npm ci` dans un agent Docker `node:24-alpine` (`reuseNode true`) |
+| Quality (parallèle) | **Lint** (`npm run lint`) et **Unit tests** (Vitest + rapport JUnit) |
+| Build image | `docker build` avec le label `org.opencontainers.image.revision=${GIT_COMMIT}` et le tag `${IMAGE_NAME}:${SHORT_SHA}` |
+| Push | `docker push`, **uniquement sur `main`**, avec le credential `dockerhub` |
+| post | `junit` (always), `archiveArtifacts image.txt`, `cleanWs` (cleanup) |
+
+Options : `disableConcurrentBuilds()`, `timestamps()`, `timeout(60 min)`, `buildDiscarder`.
+
+Points importants :
+
+- Le rapport JUnit est produit avec :
+  `npm test -- --reporter=default --reporter=junit --outputFile.junit=reports/junit.xml`
+  (le script `npm test` du projet exclut les tests d'intégration, qui exigent PostgreSQL).
+- Le token Docker Hub est injecté avec `withCredentials` et utilisé via `--password-stdin`, dans des `sh` à **guillemets simples** : c'est le shell, pas Groovy, qui substitue les variables, donc le secret n'est jamais interpolé dans le script.
+- La condition du stage Push couvre le job Multibranch (`branch 'main'`) et le job Pipeline simple (`GIT_BRANCH == 'origin/main'`).
+
+---
+
+## 2. Captures
+
+### 2.1 Vue des stages : Lint et Unit tests en parallèle
+
+Build #4 du job `contact-api` : tous les stages sont verts, **Lint** et **Unit tests** s'exécutent en parallèle dans *Quality*.
+
+![Vue des stages](captures/pipeline-stages.png)
+
+### 2.2 Rapport JUnit : un test en échec puis corrigé
+
+Un test a été cassé volontairement (`GET /api/health`). Sur le build #5, **Unit tests** passe en rouge, **Build image** et **Push** sont sautés, le bloc `post` s'exécute et l'onglet *Tests* affiche le test en échec. Après correction (build #6), les 14 tests passent.
+
+![Rapport JUnit](captures/junit-report.png)
+
+### 2.3 Credential masqué dans les logs
+
+Le token Docker Hub apparaît sous la forme `****` dans la Console Output (`Masking supported pattern matches of $DH_TOKEN`), et le login réussit.
+
+![Credential masqué](captures/credentials-masked.png)
+
+### 2.4 Image taguée avec le Git SHA
+
+Le tag de l'image sur Docker Hub correspond au résultat de `git rev-parse --short HEAD` : ici `daada40` (build #6 du job `contact-api`). Sur `main`, le build final du Multibranch (#2, après le merge de la PR) a poussé le tag `827549a`, qui correspond aussi à `git rev-parse --short HEAD` sur `main`.
+
+![Tag SHA sur Docker Hub](captures/dockerhub-sha-tag.png)
+
+### 2.5 Multibranch Pipeline
+
+Le job `contact-api-multibranch` découvre `main`, la branche `feature/rate-limit-config` et la Pull Request `PR-1`. Le stage **Push est sauté** sur la branche et sur la PR, et **exécuté sur `main`** après le merge (build #2, commit `827549a`, artefact `image.txt`).
+
+![Multibranch](captures/multibranch.png)
+
+---
+
+## 3. Configuration Jenkins
+
+**Plugins** : Pipeline, Git, GitHub Branch Source, Docker Pipeline, JUnit, Credentials Binding, Workspace Cleanup, Timestamper.
+
+**Accès Docker** : `sudo usermod -aG docker jenkins && sudo systemctl restart jenkins`
+
+**Credentials** :
+
+| ID | Type | Usage |
+|---|---|---|
+| `dockerhub` | Username with password (access token Docker Hub) | Push de l'image |
+| `github` | Username with password (fine-grained token, lecture seule) | Scan du dépôt par le Multibranch |
+
+**Job Multibranch** : source GitHub, scan périodique toutes les 2 minutes (« Periodically if not otherwise run »), car la VM n'est pas joignable depuis Internet et ne peut pas recevoir de webhook. La stratégie *Discover branches* est réglée sur **All branches** pour afficher la branche en même temps que sa PR.
+
+---
+
+## 4. Problèmes rencontrés et solutions
+
+| Problème | Cause | Solution |
+|---|---|---|
+| Jenkins ne démarrait pas (`start operation timed out`) | Démarrage lent sur une petite VM, timeout systemd par défaut | `TimeoutStartSec=600` dans un override systemd |
+| Contrôleur « déconnecté », builds en attente | `/tmp` (tmpfs) sous le seuil de 1 Go : accumulation de fichiers `winstone*.jar` | Nettoyage de `/tmp`, `java.io.tmpdir` déplacé vers `/var/lib/jenkins/tmp` |
+| Pipeline `ABORTED` pendant le push | `timeout(20 min)` dépassé | Timeout porté à 60 minutes |
+| `docker push` coupé (`use of closed network connection`, timeout) | Perte de paquets sur le réseau de la VM (environ 15 %) et couche d'environ 57 Mo | Nouvel essai quand la perte est revenue à 0 % : toutes les couches ont été envoyées, puis le stage Push du pipeline est passé |
+| Branche barrée dans le Multibranch | Comportement par défaut : exclure les branches déjà couvertes par une PR | *Discover branches → All branches* |
+
+---
+
+## 5. Commandes utiles
 
 ```bash
-npm install
-cp .env.example .env            # puis changer le mot de passe
-set -a; . ./.env; set +a
-docker compose up -d --wait
-npm run migrate
-npm start                       # API sur http://localhost:4000
+# Tests et lint en local
+npm ci
+npm run lint
+npm test
+
+# Rapport JUnit comme dans le pipeline
+npm test -- --reporter=default --reporter=junit --outputFile.junit=reports/junit.xml
+
+# Build et vérification du label de l'image
+SHORT_SHA=$(git rev-parse --short=7 HEAD)
+docker build --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+  -t wissl/contact-api:$SHORT_SHA .
+docker inspect wissl/contact-api:$SHORT_SHA \
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+
+# Comparer avec le tag affiché sur Docker Hub
+git rev-parse --short HEAD
 ```
 
-| Commande | Rôle |
+---
+
+## 6. Livrables
+
+| Fichier | Contenu |
 |---|---|
-| `npm test` | Tests unitaires et de routes (repository en mémoire) |
-| `npm run test:coverage` | Couverture de code |
-| `npm run test:integration` | Test d'intégration contre PostgreSQL |
-| `npm run migrate` | Applique les migrations SQL (idempotent) |
+| `Jenkinsfile` | Pipeline final |
+| `captures/pipeline-stages.png` | Lint et Unit tests en parallèle |
+| `captures/junit-report.png` | Test en échec puis corrigé |
+| `captures/credentials-masked.png` | Token masqué (`****`) |
+| `captures/dockerhub-sha-tag.png` | Tag `<sha>` sur Docker Hub et `git rev-parse --short HEAD` |
+| `captures/multibranch.png` | Jobs `main`, `feature/…` et `PR-1` |
 
-## 2. Partie 1 : OWASP API Security Top 10
-
-| Risque OWASP | Concerne notre API ? | Mesure dans ce TP |
-|---|---|---|
-| API1 Broken Object Level Authorization | Non pour l'instant : aucune ressource accédée par identifiant (cela changerait avec un `GET /api/contact/:id`) | n/a |
-| API2 Broken Authentication | Non : endpoint public, sans authentification. Serait indispensable pour une route de liste | n/a (hors périmètre) |
-| API3 Broken Object Property Level Authorization | Oui : un client peut envoyer des champs en trop (`isAdmin`, `id`…) | `.strict()` refuse les champs en trop (mass assignment) |
-| API4 Unrestricted Resource Consumption | Oui : corps volumineux, rafales de requêtes | Rate limiting, taille max du corps (10 ko) |
-| API5 Broken Function Level Authorization | Non : pas de rôles ni de fonctions privilégiées | n/a |
-| API6 Unrestricted Access to Sensitive Business Flows | Oui : spam du formulaire par automatisation | Rate limiting sur `/api/contact` |
-| API7 Server Side Request Forgery | Non : l'API n'appelle aucune URL fournie par l'utilisateur | n/a |
-| API8 Security Misconfiguration | Oui : stack trace exposée, `X-Powered-By`, aucun header de sécurité | Helmet, erreurs génériques, `x-powered-by` désactivé |
-| API9 Improper Inventory Management | Faible : une seule version, peu de routes | Route 404 JSON, rien d'inutile exposé |
-| API10 Unsafe Consumption of APIs | Non : aucune API tierce consommée | n/a |
-
-### Trois attaques que la version de départ laissait passer
-
-**1. Fuite d'information (API8).** Un JSON tronqué provoquait une `500` avec la stack trace complète : chemin `/home/wissal/api-starter/...`, noms de fichiers, bibliothèques internes, ainsi que le header `X-Powered-By: Express`. Une panne de base révélait aussi l'adresse et le port de PostgreSQL (`ECONNREFUSED 127.0.0.1:5432`).
-
-**2. Entrées non validées (API3).** Types inattendus (`name` objet, `email` nombre), faux email, champ en trop (`isAdmin`), `<script>` et chaîne d'injection SQL étaient acceptés (`201`) et stockés tels quels. L'injection SQL, elle, échouait : la table `contacts` existait toujours, grâce aux requêtes paramétrées.
-
-![Attaque 2 : données invalides acceptées et stockées](captures/attaque-2-avant.png)
-
-**3. Pas de limite de débit (API4 / API6).** 20 requêtes d'affilée passaient toutes (les identifiants 1 à 21 en base le confirment), sans aucun `429`.
-
-## 3. Partie 2 : Validation et gestion des erreurs
-
-- `src/schemas/contact.js` : `name` (trim, 2 à 100), `email` (format email, ≤ 254), `message` (10 à 2000), `.strict()`.
-- `src/middlewares/validate.js` : `safeParse`, réponse `400 VALIDATION_ERROR` avec `details` (`field` + `message`), et `req.body` remplacé par les seules données validées.
-- `src/middlewares/errorHandler.js` : `INVALID_JSON` (400), `PAYLOAD_TOO_LARGE` (413), `INTERNAL_ERROR` (500). La stack est journalisée côté serveur, jamais renvoyée au client.
-- `src/app.js` : route 404 JSON `{"error":"NOT_FOUND"}` avant le middleware d'erreur.
-
-Requête invalide : les quatre problèmes (`name`, `email`, `message`, champ en trop `isAdmin`) sont détaillés.
-
-![Réponse VALIDATION_ERROR détaillée](captures/validation-400.png)
-
-## 4. Partie 3 : Durcissement HTTP
-
-- `app.disable("x-powered-by")` puis `app.use(helmet())`.
-- `express.json({ limit: "10kb" })`.
-- `express-rate-limit` uniquement sur `/api/contact` : 5 requêtes par minute et par IP, headers `RateLimit-*` standard, corps `{"error":"TOO_MANY_REQUESTS"}`.
-- Derrière un reverse proxy, ajouter `app.set("trust proxy", 1)`.
-
-### Headers avant / après Helmet
-
-Avant : `X-Powered-By: Express` et aucun header de sécurité.
-
-![Headers avant Helmet](captures/helmet-avant.png)
-
-Après : `X-Powered-By` supprimé, `Content-Security-Policy`, `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `X-Frame-Options`, etc.
-
-![Headers après Helmet](captures/helmet-apres.png)
-
-### Corps trop volumineux
-
-Un corps de 20 ko est refusé en `413 PAYLOAD_TOO_LARGE`. Les headers Helmet sont présents aussi sur cette réponse d'erreur.
-
-![413 Payload Too Large](captures/payload-413.png)
-
-### Rate limiting
-
-Sur 7 requêtes : cinq `201`, puis deux `429`.
-
-![Boucle curl terminée par des 429](captures/rate-limit-429.png)
-
-## 5. Partie 4 : Tests de routes et couverture
-
-`tests/contact.test.js` (Vitest + Supertest, repository en mémoire) couvre : message valide, email invalide, champ manquant, champ supplémentaire, types inattendus, JSON mal formé, corps > 10 ko, injection SQL stockée comme simple donnée, route 404, erreur 500 sans fuite (ni stack ni message d'origine, mais journalisée), headers Helmet, absence de `x-powered-by` et `429` après 5 requêtes.
-
-Les requêtes refusées sont aussi vérifiées côté repository : un `400` n'écrit rien (`repo.items` reste vide).
-
-**Résultat : 14 tests passés, aucun `todo`.**
-
-![npm test : tous les tests passent](captures/tests-ok.png)
-
-### Couverture
-
-Les fichiers de sécurité (`app.js`, `validate.js`, `errorHandler.js`, routes, schéma) sont à 100 % de lignes. `contactRepository.js` (51,51 %), `server.js` et `migrate.js` (0 %) sont exercés par l'intégration ou sont des scripts de démarrage. Total : 72 %.
-
-![Rapport de couverture](captures/coverage.png)
-
-## 6. Partie 5 : PostgreSQL, migrations et intégration
-
-- `migrations/001_create_contacts.sql` crée la table, `migrations/002_add_contacts_email_index.sql` ajoute l'index `idx_contacts_email`.
-- `npm run migrate` est idempotent : la première exécution affiche `migration appliquée : 002_add_contacts_email_index.sql`, la seconde n'affiche rien.
-- Vérification : `\d contacts` liste bien `idx_contacts_email btree (email)`.
-- `tests/integration/contact.int.test.js` envoie de vraies requêtes, puis contrôle directement en SQL que le contact est enregistré, que la table existe toujours après une tentative d'injection et que la valeur est stockée telle quelle. Il supprime ses propres lignes à la fin.
-
-**Résultat : 2 tests d'intégration passés.**
-
-![npm run test:integration](captures/integration-ok.png)
-
-Test manuel avec `curl` : requête valide `201`, requête invalide `400 VALIDATION_ERROR`, injection SQL `201` (table intacte, valeur stockée comme donnée).
-
-## 7. Bilan
-
-| Menace | Avant | Après |
-|---|---|---|
-| JSON cassé | `500` + stack trace | `400 INVALID_JSON` |
-| Données invalides / champs en trop | Acceptés et stockés | `400 VALIDATION_ERROR` détaillé |
-| Corps énorme | Accepté | `413 PAYLOAD_TOO_LARGE` |
-| Rafale de requêtes | Illimitée | `429` après 5 requêtes par minute |
-| Headers | `X-Powered-By`, aucune protection | Helmet, `x-powered-by` supprimé |
-| Injection SQL | Neutralisée (requêtes paramétrées) | Neutralisée et testée automatiquement |
-
-Le défi (workflow GitHub Actions et route `GET /api/contact` paginée) n'a pas été réalisé.
-
-Rate limit configurable via variables d'environnement.
+Le défi (Shared Library `buildAndPush` et plugin GitHub Checks) n'a pas été réalisé.

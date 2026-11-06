@@ -134,3 +134,150 @@ git rev-parse --short HEAD
 | `captures/multibranch.png` | Jobs `main`, `feature/…` et `PR-1` |
 
 Le défi (Shared Library `buildAndPush` et plugin GitHub Checks) n'a pas été réalisé.
+
+* * *
+
+# TP10 : DevSecOps « Shift Left »
+
+Analyse de l'application volontairement vulnérable `vuln-app` avec des outils open source (secrets, SAST, dépendances, images, configuration), branchés dans GitHub Actions et Jenkins avec des quality gates, puis correction des failles.
+
+- **Dépôt TP10** : [`wissalelkouk/vuln-app`](https://github.com/wissalelkouk/vuln-app) (code corrigé, `security.yml`, `dependabot.yml`, `Jenkinsfile`)
+- **Outils** : Gitleaks, pre-commit, Semgrep, npm audit, Trivy, Dependabot, CodeQL, GitHub Actions, Jenkins
+- **Le Jenkinsfile du TP9 n'étant pas dans `vuln-app`**, un Jenkinsfile dédié a été créé pour le TP10 (job `vuln-app`, branche `ci/jenkins`).
+
+## 1. Carte des scanners
+
+| Famille | Question posée | Outils utilisés |
+|---------|----------------|-----------------|
+| Secrets | Un mot de passe ou un token est-il dans Git ? | Gitleaks, push protection GitHub |
+| SAST | Mon code contient-il des motifs dangereux ? | Semgrep, CodeQL |
+| SCA | Mes dépendances ont-elles des CVE connues ? | npm audit, Trivy fs, Dependabot |
+| Image | Les paquets de l'image ont-ils des CVE ? | Trivy image |
+| Config | Le Dockerfile est-il mal configuré ? | Trivy config |
+
+## 2. Partie 1 : Secrets (Gitleaks)
+
+Gitleaks a détecté **1 secret sur 3** : règle `generic-api-key`, `src/config.js` ligne 5 (`jwt_secret`), commit `8b0c839`. `payment_api_key` et `db_password` n'ont pas été détectés : un scanner ne voit pas tout, les trois valeurs ont donc été retirées.
+
+Les secrets sont passés dans des variables d'environnement (`process.env`), avec `.env.example` versionné et `.env` ignoré. Gitleaks détecte toujours le secret **dans l'historique** : supprimer la ligne ne suffit jamais. Pour un vrai secret : le **révoquer** (il est compromis), puis éventuellement réécrire l'historique (`git filter-repo`). Pour le lab, l'historique a été recréé, et Gitleaks répond `no leaks found`.
+
+[![Gitleaks](captures/tp10-gitleaks.png)](captures/tp10-gitleaks.png)
+
+## 3. Partie 2 : Hook pre-commit
+
+Le hook Gitleaks refuse un commit contenant `const token = "…"` (`generic-api-key`, `src/test-secret.js:1`, exit code 1).
+
+[![Commit refusé](captures/tp10-pre-commit-blocked.png)](captures/tp10-pre-commit-blocked.png)
+
+## 4. Partie 3 : SAST (Semgrep)
+
+Premier scan : **7 résultats bloquants**. Après correction : **0 résultat, code retour 0**.
+
+| Règle | Fichier:ligne | Vrai positif ? | Correction |
+|-------|---------------|----------------|------------|
+| `raw-html-format` | `server.js:32` | Oui | `res.json` |
+| `direct-response-write` | `server.js:32` | Oui (même faille) | `res.json` |
+| `missing-user` | `Dockerfile:8` | Oui | `USER node` |
+| `github-actions-mutable-action-tag` (×4) | `security.yml:18, 26, 33, 40` | Oui | Actions épinglées par SHA complet |
+| *(non détecté)* injection SQL | `server.js:21` | Oui | requête paramétrée `?` |
+| *(non détecté)* injection de commande | `server.js:27` | Oui | `execFile` + validation de `host` |
+| *(non détecté)* JWT sans expiration | `server.js:43` | Oui | `expiresIn: "1h"` |
+
+Semgrep n'a pas signalé l'injection SQL, l'injection de commande ni le JWT : ces failles ont été corrigées à la main, ce qui montre l'intérêt de combiner plusieurs outils.
+
+[![Semgrep avant / après](captures/tp10-semgrep-before-after.png)](captures/tp10-semgrep-before-after.png)
+
+## 5. Partie 4 : Dépendances, images et configuration
+
+| Contrôle | Avant | Après |
+|----------|-------|-------|
+| `npm audit` | 16 (1 critical, 10 high, 5 low) | **0** |
+| Trivy fs (dépendances) | nombreuses CVE HIGH/CRITICAL (`tar`…) | **0** |
+| Trivy config | `DS-0031` **CRITICAL** (`ENV DB_PASSWORD=…`) | `DS-0026` LOW, corrigé par un `HEALTHCHECK` |
+| Trivy image (GitHub Actions) | Debian 10 : 16 + 2 CRITICAL | Alpine 3.24 (`node:24-alpine`) : plus de CRITICAL corrigeable |
+
+Mises à jour : `express`, `jsonwebtoken` 9, `lodash` 4.18, `sqlite3` 6. Dockerfile réécrit : `node:24-alpine`, multi-stage, `USER node`, aucun secret dans `ENV`.
+
+Job `image` de GitHub Actions après correction (Alpine, tous les paquets à 0, job vert) :
+
+[![Trivy image après](captures/tp10-trivy-after.png)](captures/tp10-trivy-after.png)
+
+**Dependency-Check** : la mise à jour de la base NVD a échoué (clé d'API refusée). Il a été remplacé par **Trivy fs**.
+
+**Trivy image** : la base n'a pas pu être téléchargée de façon fiable depuis la VM (réseau très lent). Les scans d'image ont été exécutés dans GitHub Actions et Jenkins, la base ayant ensuite été mise en cache localement pour `fs` et `config`.
+
+## 6. Partie 5 : GitHub
+
+**Dependabot** : PR ouvertes automatiquement (`express` 4.22.3 → 5.3.0, `upload-sarif`). Le passage à Express 5 est un changement majeur : la PR n'a pas été fusionnée.
+
+[![Dependabot](captures/tp10-dependabot-pr.png)](captures/tp10-dependabot-pr.png)
+
+**CodeQL vs Semgrep** (PR #3 qui réintroduit les failles) :
+
+| Faille | Semgrep | CodeQL |
+|--------|---------|--------|
+| Injection SQL | Non détectée | Non détectée |
+| Injection de commande | Non détectée | Non détectée |
+| XSS | Oui (2 règles) | Oui (High) |
+| Rate limiting | Non | Oui (High, sur `main`) |
+| Permissions du workflow | Non | Oui (Medium, sur `main`) |
+
+[![Alertes CodeQL](captures/tp10-codeql-alerts.png)](captures/tp10-codeql-alerts.png)
+
+**Workflow `security.yml`** : `permissions: contents: read` au niveau du workflow, `security-events: write` uniquement dans le job `sast` (export SARIF), Gitleaks, Semgrep, `npm audit` et Trivy en conteneurs, Actions tierces épinglées par SHA.
+
+Pourquoi épingler par SHA ? Un tag (`v4`) peut être déplacé vers du code malveillant si le dépôt de l'Action est compromis. Un SHA de commit est immuable, et Dependabot (`github-actions`) propose ensuite les mises à jour.
+
+**Ruleset `protect-main`** : PR obligatoire, 1 approbation, checks `secrets`, `sast`, `dependencies`, `image` obligatoires, force push bloqué. La PR #3 (faille réintroduite) est bloquée : `sast` et CodeQL sont en échec, `image` est ignoré.
+
+[![PR bloquée](captures/tp10-pr-blocked.png)](captures/tp10-pr-blocked.png)
+
+La PR #4 (correctif) passe tous les checks mais reste bloquée tant qu'un relecteur n'approuve pas. Seul développeur, j'ai ajouté un bypass temporaire pour la fusionner, puis je l'ai retiré.
+
+[![PR #4](captures/tp10-pr4-review-required.png)](captures/tp10-pr4-review-required.png)
+
+## 7. Partie 6 : Quality gates dans Jenkins
+
+Le `Jenkinsfile` exécute `Checkout`, `Build`, puis un stage **Security** avec Gitleaks, Semgrep et `npm audit` **en parallèle**, puis **Image scan** (Trivy `--exit-code 1 --severity CRITICAL`). Les rapports sont archivés (`archiveArtifacts 'reports/**'`).
+
+- **Build #3 : rouge.** Semgrep a détecté la faille (XSS), `Image scan` est ignoré et aucun rapport Trivy n'est produit.
+- **Build #4 : vert.** `server.js` corrigé, image scannée sur Alpine, 4 rapports archivés.
+
+[![Stages Jenkins](captures/tp10-jenkins-stages.png)](captures/tp10-jenkins-stages.png)
+
+| Build #3 (rouge) | Build #4 (vert) |
+|------------------|-----------------|
+| [![#3](captures/tp10-jenkins-build3-artifacts.png)](captures/tp10-jenkins-build3-artifacts.png) | [![#4](captures/tp10-jenkins-build4-artifacts.png)](captures/tp10-jenkins-build4-artifacts.png) |
+
+## 8. Défi
+
+- **Règle Semgrep personnalisée** (`.semgrep/no-log-body.yml`) interdisant `console.log(req.body)`, ajoutée à `security.yml` et au `Jenkinsfile`. Test : `Findings: 1 (1 blocking)`.
+- **`.trivyignore`** avec une date d'expiration (`exp:`). L'identifiant est fictif (aucune CVE à ignorer sur l'image finale) : il illustre le format.
+- **Ignorer ou accepter un risque ?** *Ignorer* masque un résultat sans laisser de trace. *Accepter un risque* est une décision documentée : justification, responsable, date d'expiration et revue périodique. À l'échéance, le résultat réapparaît.
+
+## 9. Problèmes rencontrés
+
+| Problème | Cause | Solution |
+|----------|-------|----------|
+| `push` refusé (`workflow` scope) | Token sans le droit `workflow` | Nouveau token avec `repo` et `workflow` |
+| Hook refusé (`configuration is unstaged`) | `pre-commit autoupdate` avait modifié la config | `git add .pre-commit-config.yaml` |
+| Dependency-Check en échec | Clé d'API NVD refusée | Remplacé par Trivy fs |
+| Trivy : `context deadline exceeded` | Réseau lent vers les registres de la base | Scans dans GitHub Actions et Jenkins, base mise en cache |
+| `server.js` cassé (doublon `rateLimit`) | Corrections par `sed` appliquées deux fois | Fichier réécrit proprement, fusionné via PR |
+
+## 10. Livrables TP10
+
+| Fichier | Contenu |
+|---------|---------|
+| `captures/tp10-gitleaks.png` | Secret détecté par Gitleaks |
+| `captures/tp10-pre-commit-blocked.png` | Commit refusé par le hook |
+| `captures/tp10-semgrep-before-after.png` | Semgrep : 7 résultats puis 0 |
+| `captures/tp10-trivy-after.png` | Trivy image (Actions) : image Alpine propre |
+| `captures/tp10-dependabot-pr.png` | PR Dependabot |
+| `captures/tp10-codeql-alerts.png` | Alertes CodeQL et Semgrep sur la PR #3 |
+| `captures/tp10-pr-blocked.png` | PR bloquée par les checks obligatoires |
+| `captures/tp10-pr4-review-required.png` | PR #4 : checks verts, relecture requise |
+| `captures/tp10-jenkins-stages.png` | Pipeline Jenkins rouge (#3) puis vert (#4) |
+| `captures/tp10-jenkins-build3-artifacts.png`, `…build4-artifacts.png` | Rapports archivés |
+
+Code corrigé, `.github/workflows/security.yml`, `.github/dependabot.yml`, `Jenkinsfile` : voir [`wissalelkouk/vuln-app`](https://github.com/wissalelkouk/vuln-app).

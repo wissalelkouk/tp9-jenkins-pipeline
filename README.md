@@ -281,3 +281,94 @@ Le `Jenkinsfile` exécute `Checkout`, `Build`, puis un stage **Security** avec G
 | `captures/tp10-jenkins-build3-artifacts.png`, `…build4-artifacts.png` | Rapports archivés |
 
 Code corrigé, `.github/workflows/security.yml`, `.github/dependabot.yml`, `Jenkinsfile` : voir [`wissalelkouk/vuln-app`](https://github.com/wissalelkouk/vuln-app).
+
+
+* * *
+
+# TP11 : GitLab CI/CD et runner auto-hébergé
+
+Découverte du troisième grand outil de CI/CD après Jenkins (TP9) et GitHub Actions (TP3, TP10) : GitLab CI/CD, avec un runner auto-hébergé (executor Docker) installé sur la VM de lab.
+
+- **Projet GitLab** : [`wissalelkouk/contact-api`](https://gitlab.com/wissalelkouk/contact-api)
+- **Runner** : `lab-runner`, executor Docker, tag `lab`, image par défaut `node:24-alpine`
+- **Limite rencontrée** : GitLab.com exige une vérification d'identité (carte bancaire) avant d'exécuter un pipeline, même sur un runner auto-hébergé. La carte a été refusée par la banque, donc **aucun pipeline n'a pu s'exécuter**. Les parties qui demandent une exécution (cache, registre, rapports de sécurité) n'ont pas de capture.
+
+## 1. Partie 1 : Runner auto-hébergé
+
+GitLab Runner est installé depuis le dépôt officiel et enregistré avec un jeton `glrt-…` (jamais publié), executor Docker, tag `lab`. La commande `sudo gitlab-runner verify` répond `Verifying runner... is valid`.
+
+**Pourquoi aucun port ouvert sur la VM ?** Le runner fonctionne en mode *pull* : c'est lui qui interroge GitLab en HTTPS sortant pour récupérer les jobs. GitLab n'a jamais besoin de joindre la VM.
+
+**Risque du montage du socket Docker.** Le TP demande d'ajouter `/var/run/docker.sock` aux `volumes` du runner (`/etc/gitlab-runner/config.toml`). Un job qui accède à ce socket contrôle le démon Docker de l'hôte : il peut lancer un conteneur privilégié, lire le disque de la VM ou compromettre les autres conteneurs, ce qui équivaut presque à un accès root. C'est le principe que le défi du TP supprime (build sans privilège avec Kaniko ou Buildah).
+
+## 2. Partie 2 : Premier pipeline
+
+Le `.gitlab-ci.yml` est poussé sur `main` et validé par GitLab (« La syntaxe du pipeline est correcte »). Il définit cinq stages (`install`, `test`, `security`, `build`, `push`), des dépendances `needs`, et utilise le tag `lab` pour cibler le runner.
+
+[![Syntaxe correcte](captures/tp11-syntax-correct.png)](captures/tp11-syntax-correct.png)
+
+Une première erreur de configuration (`jobs:demo-variable:script config should be a string…`) venait d'un `echo "longueur: …"` : le `: ` dans le texte est lu comme une clé YAML. Corrigé en mettant la commande entre apostrophes. Le test Python `yaml.safe_load` ne l'avait pas vu, car il ne connaît pas le schéma de GitLab : la validation dans l'éditeur de pipeline est indispensable.
+
+## 3. Blocage : vérification d'identité
+
+Le pipeline ne démarre pas (0 job). GitLab affiche « Vérifiez votre identité pour exécuter ce pipeline », puis, dans l'onglet **Valider** : `Identity verification is required in order to run CI jobs`, alors que la syntaxe est correcte.
+
+[![Pipeline bloqué](captures/tp11-identity-required-pipeline.png)](captures/tp11-identity-required-pipeline.png)
+
+[![Validation](captures/tp11-identity-required-validate.png)](captures/tp11-identity-required-validate.png)
+
+L'étiquette « yaml non valide » est trompeuse : c'est le libellé affiché pour un pipeline refusé avant de démarrer. La vérification par carte a été refusée par la banque (`card_declined`), ce qui a empêché toute exécution.
+
+## 4. Partie 3 : Cache, artefacts, rules, registre (configuré, non exécuté)
+
+Le `.gitlab-ci.yml` final contient :
+
+- `cache` de `.npm/` avec `key: files: [package-lock.json]` ;
+- `artifacts` : `node_modules/` (1 h) et rapport JUnit (`reports: junit:`, `when: always`) ;
+- `rules` : `build-image` sur les merge requests et la branche par défaut, `push-image` uniquement sur la branche par défaut ;
+- `docker login` avec `CI_REGISTRY_USER` et `CI_REGISTRY_PASSWORD` (`--password-stdin`), puis `docker push` de `$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA` ;
+- `interruptible: true` pour annuler un pipeline obsolète ;
+- un job `demo-variable` affichant la longueur de `DEMO_TOKEN`, variable masquée et protégée (absente des branches non protégées).
+
+## 5. Partie 4 : Sécurité intégrée
+
+Templates GitLab `Jobs/SAST.gitlab-ci.yml` et `Jobs/Secret-Detection.gitlab-ci.yml` ajoutés via `include`. GitLab SAST s'appuie sur **Semgrep** et Secret Detection sur un analyseur basé sur **Gitleaks** : ce sont les moteurs du TP10. Dans l'offre gratuite, les résultats sont des artefacts JSON ; le tableau de bord et le widget de merge request demandent Ultimate, d'où `npm audit` pour les dépendances (sans `allow_failure` : une vulnérabilité `high` doit bloquer).
+
+Réglages à faire : branche `main` protégée (pas de push direct) et *Pipelines must succeed* avant fusion.
+
+## 6. Partie 5 : Comparaison Jenkins, GitHub Actions, GitLab CI/CD
+
+| Critère | Jenkins | GitHub Actions | GitLab CI/CD |
+|---------|---------|----------------|--------------|
+| Configuration | `Jenkinsfile` (Groovy), plugins | YAML dans `.github/workflows/`, actions du Marketplace | `.gitlab-ci.yml`, `include`, `needs`, `rules` |
+| Runners / agents | Serveur et agents à gérer | Runners hébergés ou auto-hébergés | Runners partagés ou auto-hébergés, modèle *pull* |
+| Secrets | Credentials Jenkins | Secrets de dépôt ou d'environnement | Variables CI/CD masquées et protégées |
+| Sécurité intégrée | Aucune, outils externes en conteneurs | Dependabot, CodeQL, secret scanning, push protection | Templates SAST et Secret Detection, le reste en Ultimate |
+| Maintenance | Lourde (Jenkins, plugins, sauvegardes) | Faible, gérée par GitHub | Faible sur GitLab.com, runner à maintenir |
+| Intégration Git | Plugins et webhooks | Native à GitHub | Native : forge, CI et registre intégrés |
+
+**Recommandation pour une PME.** Une PME qui démarre devrait choisir **GitHub Actions** si son code est déjà sur GitHub, ou **GitLab CI/CD** pour une plateforme unique (forge, CI, registre). Les deux évitent d'exploiter un serveur, alors que Jenkins demande du temps d'administration (mises à jour, plugins, sauvegardes) qu'une petite équipe n'a pas. GitHub Actions est le plus rapide à prendre en main, avec Dependabot, CodeQL et la protection des secrets intégrés. GitLab CI/CD offre un pipeline mieux structuré et un registre de conteneurs inclus, mais certaines fonctions de sécurité sont payantes. Jenkins reste pertinent pour des besoins très spécifiques ou une infrastructure existante. Dans tous les cas, il faut appliquer le moindre privilège (secrets masqués, branches protégées, runners isolés, pas de `docker.sock`) et mettre les scanners (Gitleaks, Semgrep, Trivy, `npm audit`) dans la CI avec des quality gates dès le départ. Enfin, l'accès compte : sur GitLab.com, la vérification d'identité par carte a bloqué mon pipeline, alors que GitHub Actions n'en a pas demandé.
+
+## 7. Défi (non réalisé)
+
+Remplacer le montage du socket Docker par Kaniko (ou Buildah, BuildKit rootless) et retirer `/var/run/docker.sock` du `config.toml`. Le déploiement d'un runner dans Kubernetes (chart Helm `gitlab/gitlab-runner`) est prévu après le TP14.
+
+## 8. Problèmes rencontrés
+
+| Problème | Cause | Solution |
+|----------|-------|----------|
+| `git push` refusé (Authentication failed) | Mot de passe utilisé à la place d'un token | Personal Access Token avec `write_repository` |
+| Pipeline « yaml non valide », 0 job | Vérification d'identité GitLab non faite | Vérification par carte (refusée par la banque) |
+| `script config should be a string` | `: ` dans un `echo` lu comme clé YAML | Commande entre apostrophes |
+| `push` rejeté (`fetch first`) | Enregistrement depuis l'éditeur de pipeline GitLab | `git pull --no-rebase -X ours`, puis push ; l'éditeur ne sert qu'à valider |
+
+## 9. Livrables TP11
+
+| Fichier | Contenu |
+|---------|---------|
+| `captures/tp11-syntax-correct.png` | Syntaxe du pipeline validée par GitLab |
+| `captures/tp11-identity-required-pipeline.png` | Pipeline bloqué : vérification d'identité |
+| `captures/tp11-identity-required-validate.png` | `Identity verification is required in order to run CI jobs` |
+| `.gitlab-ci.yml` | Pipeline final (dans `contact-api`) |
+
+Captures non réalisées faute d'exécution : `runner-online`, `pipeline-graph`, `cache`, `mr-pipeline`, `container-registry`, `security-reports`.

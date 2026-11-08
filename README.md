@@ -372,3 +372,116 @@ Remplacer le montage du socket Docker par Kaniko (ou Buildah, BuildKit rootless)
 | `.gitlab-ci.yml` | Pipeline final (dans `contact-api`) |
 
 Captures non réalisées faute d'exécution : `runner-online`, `pipeline-graph`, `cache`, `mr-pipeline`, `container-registry`, `security-reports`.
+
+* * *
+
+# TP12 : Software Supply Chain (SBOM, Cosign, provenance, SLSA)
+
+Mise en place des briques qui permettent de savoir ce que contient une image (SBOM), de prouver qui l'a construite et comment (signature, provenance) et de refuser ce qui n'est pas prouvé.
+
+- **Dépôt de la partie keyless** : [`wissalelkouk/contact-api-supply-chain`](https://github.com/wissalelkouk/contact-api-supply-chain) (workflow `release.yml`, images dans GHCR)
+- **Registre du lab** : `registry:2` sur `localhost:5000` (voir la limite ci-dessous)
+- **Outils** : Syft, Grype, Trivy, Cosign v3, GitHub Actions, GitHub CLI
+
+## 1. Partie 1 et 2 : Harbor (non réalisé)
+
+Harbor n'a **pas été installé** : la VM de lab dispose de 3,5 Go de RAM (1,3 Go disponibles, swap déjà utilisé), 15 Go de disque libres et son port 80 est occupé par un autre conteneur, alors que Harbor demande 4 Go de RAM, 40 Go de disque et le port 80. Il a été remplacé par un registre `registry:2`, qui suffit pour les parties 3 à 6. Le RBAC, les robot accounts, le scan Trivy intégré avec blocage des pulls et la rétention de tags **n'ont donc pas été testés**.
+
+| Critère | GHCR | Harbor |
+|---------|------|--------|
+| Hébergement | Géré par GitHub | Auto-hébergé (VM, Kubernetes) |
+| RBAC | Droits GitHub (organisation, dépôt) | Projets, rôles, robot accounts |
+| Scan | Via GitHub (Dependabot, actions) | Trivy intégré, pull bloqué selon la gravité |
+| Réplication | Non | Oui, vers d'autres registres |
+| Coût | Gratuit pour le public, quota pour le privé | Gratuit, mais coût d'exploitation |
+| Usage hors ligne | Non | Oui (réseau isolé) |
+
+## 2. Partie 3 : SBOM (Syft) et analyse (Grype)
+
+Syft a généré le SBOM de `contact-api:test` en SPDX et CycloneDX.
+
+| Question | Réponse |
+|----------|---------|
+| Nombre de paquets | **250** |
+| Version d'`express` | **5.3.0** |
+| Version d'OpenSSL | `libssl3` **3.5.9-r0** (Alpine ne le nomme pas `openssl`) |
+
+Grype analyse le **SBOM** (et non l'image) : 24 vulnérabilités, dont 1 critique (`zlib 1.3.2-r1`, `CVE-2026-4738`, corrigé en `1.4-r0`), 7 High, 15 Medium et 1 Low. La base de Grype n'a pu être téléchargée qu'au second essai, avec un volume de cache et un délai plus long (connexion de la VM instable).
+
+Intérêt : conserver le SBOM de chaque release permet de répondre en quelques secondes à « suis-je concerné par la CVE X ? » sans reconstruire ni retélécharger les images.
+
+[![SBOM et Grype](captures/tp12-sbom-grype.png)](captures/tp12-sbom-grype.png)
+
+## 3. Partie 4 : Signer et vérifier avec Cosign (clés)
+
+Paire de clés générée avec `cosign generate-key-pair` (`cosign.key` chiffrée, jamais versionnée). L'image `1.0.0` est signée **par digest** (`sha256:02e05499…`) ; `1.0.1` est une image différente, volontairement non signée.
+
+| Test | Résultat |
+|------|----------|
+| `cosign verify` sur `1.0.0` | Réussi (claims validés, signature vérifiée avec `cosign.pub`) |
+| `cosign verify` sur `1.0.1` | `Error: no signatures found` |
+| `cosign attest` du SBOM (SPDX) puis `verify-attestation` | Réussi : statement in-toto (`in-toto.io/Statement/v0.1`) dont le prédicat est le SBOM |
+
+Une signature est liée au **digest**, pas au tag : si `1.0.1` avait eu le même contenu que `1.0.0`, elle aurait été acceptée aussi.
+
+## 4. Partie 5 : Keyless et provenance (GitHub Actions)
+
+Le workflow `release.yml`, déclenché par le tag `v1.0.0`, construit et pousse l'image dans GHCR, la signe en **keyless** (jeton OIDC, certificat éphémère Fulcio, journal public Rekor), génère le SBOM (`anchore/sbom-action`), produit une attestation de provenance (`actions/attest-build-provenance`) et joint le SBOM à la release. Actions tierces épinglées par SHA, permissions minimales (`contents: read` par défaut, droits supplémentaires limités au job).
+
+[![Run release](captures/tp12-actions-release.png)](captures/tp12-actions-release.png)
+
+[![Release et SBOM](captures/tp12-release-sbom.png)](captures/tp12-release-sbom.png)
+
+[![Paquet GHCR](captures/tp12-ghcr-package.png)](captures/tp12-ghcr-package.png)
+
+Vérification depuis la VM : `cosign verify` keyless réussit (signature et provenance SLSA v1 présentes, certificat validé) et `gh attestation verify` répond « Verification succeeded » (build et signer : `release.yml@refs/tags/v1.0.0`). Avec une **mauvaise identité** (`autre-utilisateur/autre-depot`), la vérification échoue : le certificat contient l'identité du workflow réel.
+
+[![Vérification keyless](captures/tp12-keyless-provenance.png)](captures/tp12-keyless-provenance.png)
+
+**Pourquoi l'identité attendue est essentielle ?** La signature seule prouve qu'**un** workflow a signé. Sans identité imposée, le workflow de n'importe quel autre dépôt pourrait signer et être accepté. L'identité prouve que c'est **le bon**.
+
+## 5. Partie 6 : Attaque simulée et vérification avant exécution
+
+Un « attaquant » pousse une image modifiée sous le tag `1.0.0` : le tag pointe désormais vers un autre digest (`1afba6dd…` au lieu de `02e05499…`). `docker pull` ne signale rien, alors que `cosign verify` échoue (`no signatures found`).
+
+Le script `verify-before-run.sh` résout le tag en digest, vérifie la signature sur ce digest, puis lance **ce même digest** : un attaquant ne peut pas changer le tag entre la vérification et l'exécution. Sur l'image remplacée : `REFUSÉ`, code retour 1, aucun conteneur lancé. Sur l'image légitime : `OK : signature valide`, le conteneur démarre, code retour 0.
+
+[![Attaque détectée](captures/tp12-attack-detected.png)](captures/tp12-attack-detected.png)
+
+Limites du script : il fait confiance à la clé locale `cosign.pub`, et il protège seulement ce poste. Une protection de plateforme (admission controller Kubernetes) vérifie la signature avant tout déploiement. `registry:2` accepte d'écraser un tag ; avec Harbor, les tags immuables (`v*`) l'auraient refusé.
+
+## 6. SLSA et in-toto
+
+| Niveau | Exigence principale | Atteint par |
+|--------|---------------------|-------------|
+| Build L1 | Provenance existante | Pipeline Jenkins si on génère une provenance ; build sur le poste : non |
+| Build L2 | Provenance signée, générée par une plateforme hébergée | Workflow GitHub Actions avec `actions/attest-build-provenance` |
+| Build L3 | Plateforme durcie, provenance infalsifiable par le projet | Non atteint ici (il faudrait un workflow réutilisable isolé, `slsa-github-generator`) |
+
+- **(a) Build sur le poste du développeur** : aucun niveau, rien ne prouve comment l'artefact a été fabriqué.
+- **(b) Pipeline Jenkins auto-hébergé** : la provenance dépend de notre propre configuration et de ce que nous signons : au mieux L1, L2 si elle est signée par la plateforme.
+- **(c) GitHub Actions avec attestation** : **L2**.
+
+**Rôle d'in-toto** : un *layout* décrit les étapes attendues et qui peut les exécuter ; chaque étape produit un *link* signé (entrées, sorties, commande) ; la vérification compare les links au layout. Les attestations de Cosign et de GitHub sont des *statements* in-toto : un sujet (le digest de l'image) plus un prédicat (SBOM, provenance), signés.
+
+## 7. Problèmes rencontrés
+
+| Problème | Cause | Solution |
+|----------|-------|----------|
+| Harbor impossible | 3,5 Go de RAM, 15 Go de disque, port 80 pris | Registre `registry:2` |
+| Grype : `database does not exist` | Téléchargement de la base coupé (réseau) | Volume de cache, délai de 30 min |
+| `1.0.1` aurait pu être validé | Même digest que `1.0.0` | Image reconstruite avec un label |
+| Dépôt `contact-api` déjà existant | Projet du TP8 | Nouveau dépôt `contact-api-supply-chain` |
+| `push` refusé (`workflow` scope) | Token sans le droit `workflow` | Connexion par `gh auth login` (navigateur), ancien token révoqué |
+| `gh attestation` introuvable | `gh 2.46` (apt Ubuntu) trop ancien | `gh 2.103` depuis le dépôt officiel |
+
+## 8. Livrables TP12
+
+| Fichier | Contenu |
+|---------|---------|
+| `captures/tp12-sbom-grype.png` | Résultat Grype sur le SBOM |
+| `captures/tp12-keyless-provenance.png` | `gh attestation verify` réussi et échec avec une mauvaise identité |
+| `captures/tp12-attack-detected.png` | Image remplacée détectée, `verify-before-run.sh` refusé puis accepté |
+| `captures/tp12-actions-release.png`, `tp12-release-sbom.png`, `tp12-ghcr-package.png` | Run `release`, release avec `sbom.spdx.json`, paquet GHCR |
+
+Non réalisés faute de Harbor : `harbor-project`, `harbor-rbac-denied`, `harbor-scan`, `harbor-retention`. Non fournie en capture : la sortie de `cosign verify` avec clés (réussi sur `1.0.0`, échec sur `1.0.1`).
